@@ -82,14 +82,24 @@ backup_datasets=("${(@f)$(
         | sort -u
 )}")
 
-# Build a map of dataset -> total snapshot space (in bytes).
-# We query all matching snapshots once, then aggregate per dataset.
+# Build a map of dataset -> total space (in bytes).
+# This includes both the dataset's own "used" space and the sum of all its
+# snapshot "used" values, giving the full reclaimable footprint per dataset.
 # Using -p for parseable (exact byte) output to allow summing.
-echo "Computing snapshot space usage..."
+echo "Computing space usage (datasets + snapshots)..."
 typeset -A dataset_space
+
+# 1) Dataset own space (filesystem/volume "used" property).
+while IFS=$'\t' read -r ds_name ds_used; do
+    dataset_space[$ds_name]=$(( ${dataset_space[$ds_name]:-0} + ds_used ))
+done < <(
+    sudo zfs list -t filesystem,volume -o name,used -Hp -r "${BACKUPS_DATASET}" \
+        | grep "${FILTER_PATTERN}"
+)
+
+# 2) Add each snapshot's "used" space on top.
 while IFS=$'\t' read -r snap_name snap_used; do
     ds="${snap_name%%@*}"
-    # Only process datasets in our filtered set
     dataset_space[$ds]=$(( ${dataset_space[$ds]:-0} + snap_used ))
 done < <(
     sudo zfs list -t snapshot -o name,used -Hp -r "${BACKUPS_DATASET}" \
