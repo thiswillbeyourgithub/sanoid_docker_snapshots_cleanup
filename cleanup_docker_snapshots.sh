@@ -149,6 +149,31 @@ for ds in "${backup_datasets[@]}"; do
     fi
 done
 
+# ── Deduplicate: remove datasets whose ancestor is also in the orphaned list ──
+# When we destroy a parent with -R, its children are destroyed too.
+# Keeping children in the list would cause "dataset does not exist" errors.
+typeset -A orphaned_set
+for ds in "${orphaned[@]}"; do
+    orphaned_set[$ds]=1
+done
+
+deduped_orphaned=()
+for ds in "${orphaned[@]}"; do
+    local parent="$ds"
+    local is_child=false
+    while [[ "$parent" == */* ]]; do
+        parent="${parent%/*}"
+        if [[ -n "${orphaned_set[$parent]:-}" ]]; then
+            is_child=true
+            break
+        fi
+    done
+    if [[ "$is_child" == false ]]; then
+        deduped_orphaned+=("$ds")
+    fi
+done
+orphaned=("${deduped_orphaned[@]}")
+
 # ── Report ────────────────────────────────────────────────────────────────────
 echo ""
 local still_exist_total=0
@@ -209,6 +234,10 @@ if [[ "$DELETE" == true || "$DRY" == true ]]; then
         echo "Deleting orphaned datasets..."
         for ds in "${orphaned[@]}"; do
             (( current++ )) || true
+            if ! sudo zfs list -H -o name "${ds}" &>/dev/null; then
+                echo "  [${current}/${total}] Skipping ${ds} (already destroyed by a prior -R)"
+                continue
+            fi
             echo "  [${current}/${total}] Destroying ${ds}..."
             sudo zfs destroy -R "${ds}"
         done
