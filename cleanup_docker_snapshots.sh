@@ -52,6 +52,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ── Helper: human-readable size ──────────────────────────────────────────────
+# Converts a byte count to a human-readable string (K, M, G, T).
+human_size() {
+    local bytes=$1
+    if (( bytes >= 1099511627776 )); then
+        printf "%.1fT" $(( bytes / 1099511627776.0 ))
+    elif (( bytes >= 1073741824 )); then
+        printf "%.1fG" $(( bytes / 1073741824.0 ))
+    elif (( bytes >= 1048576 )); then
+        printf "%.1fM" $(( bytes / 1048576.0 ))
+    elif (( bytes >= 1024 )); then
+        printf "%.1fK" $(( bytes / 1024.0 ))
+    else
+        printf "%dB" "$bytes"
+    fi
+}
+
 # ── Collect data ──────────────────────────────────────────────────────────────
 
 # Get unique dataset names (without snapshot part) from the backup pool
@@ -64,6 +81,20 @@ backup_datasets=("${(@f)$(
         | cut -d@ -f1 \
         | sort -u
 )}")
+
+# Build a map of dataset -> total snapshot space (in bytes).
+# We query all matching snapshots once, then aggregate per dataset.
+# Using -p for parseable (exact byte) output to allow summing.
+echo "Computing snapshot space usage..."
+typeset -A dataset_space
+while IFS=$'\t' read -r snap_name snap_used; do
+    ds="${snap_name%%@*}"
+    # Only process datasets in our filtered set
+    dataset_space[$ds]=$(( ${dataset_space[$ds]:-0} + snap_used ))
+done < <(
+    sudo zfs list -t snapshot -o name,used -Hp -r "${BACKUPS_DATASET}" \
+        | grep "${FILTER_PATTERN}"
+)
 
 # Get existing datasets on the original pool that match the filter pattern.
 # These are the "live" datasets — containers that still exist.
@@ -100,19 +131,27 @@ done
 
 # ── Report ────────────────────────────────────────────────────────────────────
 echo ""
+local still_exist_total=0
 echo "=== Still exist on ${ORIGINAL_DATASET} (${#still_exist[@]} datasets) ==="
 for ds in "${still_exist[@]}"; do
-    echo "  $ds"
+    local sz=${dataset_space[$ds]:-0}
+    (( still_exist_total += sz ))
+    echo "  $ds  ($(human_size $sz))"
 done
+echo "  Total: $(human_size $still_exist_total)"
 
 echo ""
+local orphaned_total=0
 echo "=== Orphaned — missing from ${ORIGINAL_DATASET} (${#orphaned[@]} datasets) ==="
 for ds in "${orphaned[@]}"; do
-    echo "  $ds"
+    local sz=${dataset_space[$ds]:-0}
+    (( orphaned_total += sz ))
+    echo "  $ds  ($(human_size $sz))"
 done
+echo "  Total: $(human_size $orphaned_total)"
 
 echo ""
-echo "Summary: ${#still_exist[@]} still exist, ${#orphaned[@]} orphaned"
+echo "Summary: ${#still_exist[@]} still exist ($(human_size $still_exist_total)), ${#orphaned[@]} orphaned ($(human_size $orphaned_total))"
 
 # ── Delete if requested ──────────────────────────────────────────────────────
 if [[ "$DELETE" == true ]]; then
