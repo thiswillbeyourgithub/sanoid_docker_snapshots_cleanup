@@ -17,6 +17,8 @@ BACKUPS_DATASET="backups"
 ORIGINAL_DATASET="rpool"
 FILTER_PATTERN="var/docker"
 DELETE=false
+DRY=false
+SPACE=false
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
 usage() {
@@ -29,8 +31,10 @@ Options:
   --backups-dataset-name NAME   Backup pool/dataset name (default: backups)
   --original-dataset-name NAME  Original pool/dataset name (default: rpool)
   --filter-pattern PATTERN      Substring to match in dataset names (default: var/docker)
-  --delete                      Actually destroy orphaned snapshots (default: dry-run listing)
-  -h, --help                    Show this help
+  --space                        Compute and display space usage per dataset
+  --dry                          Simulate deletion (print what would be destroyed)
+  --delete                       Actually destroy orphaned snapshots (default: dry-run listing)
+  -h, --help                     Show this help
 EOF
 }
 
@@ -43,6 +47,10 @@ while [[ $# -gt 0 ]]; do
             ORIGINAL_DATASET="$2"; shift 2 ;;
         --filter-pattern)
             FILTER_PATTERN="$2"; shift 2 ;;
+        --space)
+            SPACE=true; shift ;;
+        --dry)
+            DRY=true; shift ;;
         --delete)
             DELETE=true; shift ;;
         -h|--help)
@@ -82,29 +90,31 @@ backup_datasets=("${(@f)$(
         | sort -u
 )}")
 
-# Build a map of dataset -> total space (in bytes).
-# This includes both the dataset's own "used" space and the sum of all its
-# snapshot "used" values, giving the full reclaimable footprint per dataset.
-# Using -p for parseable (exact byte) output to allow summing.
-echo "Computing space usage (datasets + snapshots)..."
 typeset -A dataset_space
+if [[ "$SPACE" == true ]]; then
+    # Build a map of dataset -> total space (in bytes).
+    # This includes both the dataset's own "used" space and the sum of all its
+    # snapshot "used" values, giving the full reclaimable footprint per dataset.
+    # Using -p for parseable (exact byte) output to allow summing.
+    echo "Computing space usage (datasets + snapshots)..."
 
-# 1) Dataset own space (filesystem/volume "used" property).
-while IFS=$'\t' read -r ds_name ds_used; do
-    dataset_space[$ds_name]=$(( ${dataset_space[$ds_name]:-0} + ds_used ))
-done < <(
-    sudo zfs list -t filesystem,volume -o name,used -Hp -r "${BACKUPS_DATASET}" \
-        | grep "${FILTER_PATTERN}"
-)
+    # 1) Dataset own space (filesystem/volume "used" property).
+    while IFS=$'\t' read -r ds_name ds_used; do
+        dataset_space[$ds_name]=$(( ${dataset_space[$ds_name]:-0} + ds_used ))
+    done < <(
+        sudo zfs list -t filesystem,volume -o name,used -Hp -r "${BACKUPS_DATASET}" \
+            | grep "${FILTER_PATTERN}"
+    )
 
-# 2) Add each snapshot's "used" space on top.
-while IFS=$'\t' read -r snap_name snap_used; do
-    ds="${snap_name%%@*}"
-    dataset_space[$ds]=$(( ${dataset_space[$ds]:-0} + snap_used ))
-done < <(
-    sudo zfs list -t snapshot -o name,used -Hp -r "${BACKUPS_DATASET}" \
-        | grep "${FILTER_PATTERN}"
-)
+    # 2) Add each snapshot's "used" space on top.
+    while IFS=$'\t' read -r snap_name snap_used; do
+        ds="${snap_name%%@*}"
+        dataset_space[$ds]=$(( ${dataset_space[$ds]:-0} + snap_used ))
+    done < <(
+        sudo zfs list -t snapshot -o name,used -Hp -r "${BACKUPS_DATASET}" \
+            | grep "${FILTER_PATTERN}"
+    )
+fi
 
 # Get existing datasets on the original pool that match the filter pattern.
 # These are the "live" datasets — containers that still exist.
@@ -144,48 +154,66 @@ echo ""
 local still_exist_total=0
 echo "=== Still exist on ${ORIGINAL_DATASET} (${#still_exist[@]} datasets) ==="
 for ds in "${still_exist[@]}"; do
-    local sz=${dataset_space[$ds]:-0}
-    (( still_exist_total += sz ))
-    echo "  $ds  ($(human_size $sz))"
+    if [[ "$SPACE" == true ]]; then
+        local sz=${dataset_space[$ds]:-0}
+        (( still_exist_total += sz )) || true
+        echo "  $ds  ($(human_size $sz))"
+    else
+        echo "  $ds"
+    fi
 done
-echo "  Total: $(human_size $still_exist_total)"
+if [[ "$SPACE" == true ]]; then
+    echo "  Total: $(human_size $still_exist_total)"
+fi
 
 echo ""
 local orphaned_total=0
-echo "=== Orphaned — missing from ${ORIGINAL_DATASET} (${#orphaned[@]} datasets) ==="
+echo "=== Orphaned -- missing from ${ORIGINAL_DATASET} (${#orphaned[@]} datasets) ==="
 for ds in "${orphaned[@]}"; do
-    local sz=${dataset_space[$ds]:-0}
-    (( orphaned_total += sz ))
-    echo "  $ds  ($(human_size $sz))"
+    if [[ "$SPACE" == true ]]; then
+        local sz=${dataset_space[$ds]:-0}
+        (( orphaned_total += sz )) || true
+        echo "  $ds  ($(human_size $sz))"
+    else
+        echo "  $ds"
+    fi
 done
-echo "  Total: $(human_size $orphaned_total)"
+if [[ "$SPACE" == true ]]; then
+    echo "  Total: $(human_size $orphaned_total)"
+fi
 
 echo ""
-echo "Summary: ${#still_exist[@]} still exist ($(human_size $still_exist_total)), ${#orphaned[@]} orphaned ($(human_size $orphaned_total))"
+if [[ "$SPACE" == true ]]; then
+    echo "Summary: ${#still_exist[@]} still exist ($(human_size $still_exist_total)), ${#orphaned[@]} orphaned ($(human_size $orphaned_total))"
+else
+    echo "Summary: ${#still_exist[@]} still exist, ${#orphaned[@]} orphaned"
+fi
 
 # ── Delete if requested ──────────────────────────────────────────────────────
-if [[ "$DELETE" == true ]]; then
+if [[ "$DELETE" == true || "$DRY" == true ]]; then
     if [[ ${#orphaned[@]} -eq 0 ]]; then
         echo "Nothing to delete."
         exit 0
     fi
 
     echo ""
-    echo "Deleting orphaned snapshots..."
     local total=${#orphaned[@]}
     local current=0
-    for ds in "${orphaned[@]}"; do
-        (( current++ ))
-        local pct=$(( current * 100 / total ))
-        local filled=$(( pct / 2 ))
-        local empty=$(( 50 - filled ))
-        printf "\r  [%-50s] %3d%% (%d/%d) %s" \
-            "$(printf '#%.0s' {1..$filled})" \
-            "$pct" "$current" "$total" "$ds"
-        sudo zfs destroy -r "${ds}"
-    done
-    echo ""
-    echo "Done. Deleted ${total} orphaned datasets and their snapshots."
+    if [[ "$DRY" == true ]]; then
+        echo "Dry run -- would destroy ${total} orphaned datasets:"
+        for ds in "${orphaned[@]}"; do
+            (( current++ )) || true
+            echo "  [${current}/${total}] Would destroy ${ds}"
+        done
+    else
+        echo "Deleting orphaned datasets..."
+        for ds in "${orphaned[@]}"; do
+            (( current++ )) || true
+            echo "  [${current}/${total}] Destroying ${ds}..."
+            sudo zfs destroy -r "${ds}"
+        done
+        echo "Done. Deleted ${total} orphaned datasets and their snapshots."
+    fi
 else
     if [[ ${#orphaned[@]} -gt 0 ]]; then
         echo ""
