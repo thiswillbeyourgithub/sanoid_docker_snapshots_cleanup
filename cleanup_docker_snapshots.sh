@@ -1,0 +1,138 @@
+#!/usr/bin/env zsh
+# cleanup_docker_snapshots.sh
+#
+# Cleans up orphaned ZFS snapshots of docker containers on a backup pool.
+#
+# When sanoid snapshots a system and syncoid replicates to a backup pool,
+# docker container datasets (ephemeral by nature) get snapshotted too.
+# When containers are removed on the original pool, those backup snapshots
+# become orphans that waste space. This script finds and optionally deletes them.
+#
+# Written with Claude Code.
+
+set -euo pipefail
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+BACKUPS_DATASET="backups"
+ORIGINAL_DATASET="rpool"
+FILTER_PATTERN="var/docker"
+DELETE=false
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+Usage: cleanup_docker_snapshots.sh [OPTIONS]
+
+Find (and optionally delete) orphaned docker ZFS snapshots on a backup pool.
+
+Options:
+  --backups-dataset-name NAME   Backup pool/dataset name (default: backups)
+  --original-dataset-name NAME  Original pool/dataset name (default: rpool)
+  --filter-pattern PATTERN      Substring to match in dataset names (default: var/docker)
+  --delete                      Actually destroy orphaned snapshots (default: dry-run listing)
+  -h, --help                    Show this help
+EOF
+}
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --backups-dataset-name)
+            BACKUPS_DATASET="$2"; shift 2 ;;
+        --original-dataset-name)
+            ORIGINAL_DATASET="$2"; shift 2 ;;
+        --filter-pattern)
+            FILTER_PATTERN="$2"; shift 2 ;;
+        --delete)
+            DELETE=true; shift ;;
+        -h|--help)
+            usage; exit 0 ;;
+        *)
+            echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+# ── Collect data ──────────────────────────────────────────────────────────────
+
+# Get unique dataset names (without snapshot part) from the backup pool
+# that match the filter pattern.
+# e.g. "backups/var/docker/abc123"
+echo "Listing backup snapshots matching '${FILTER_PATTERN}' in '${BACKUPS_DATASET}'..."
+backup_datasets=("${(@f)$(
+    sudo zfs list -t snapshot -o name -H -r "${BACKUPS_DATASET}" \
+        | grep "${FILTER_PATTERN}" \
+        | cut -d@ -f1 \
+        | sort -u
+)}")
+
+# Get existing datasets on the original pool that match the filter pattern.
+# These are the "live" datasets — containers that still exist.
+# e.g. "rpool/var/docker/abc123"
+echo "Listing live datasets matching '${FILTER_PATTERN}' in '${ORIGINAL_DATASET}'..."
+original_datasets=("${(@f)$(
+    sudo zfs list -t filesystem,volume -o name -H -r "${ORIGINAL_DATASET}" \
+        | grep "${FILTER_PATTERN}" \
+        | sort -u
+)}")
+
+# ── Build lookup set of original dataset suffixes ─────────────────────────────
+# We strip the pool prefix to compare across pools.
+# "rpool/var/docker/abc123" -> "var/docker/abc123"
+typeset -A original_set
+for ds in "${original_datasets[@]}"; do
+    # Remove the pool prefix (everything up to and including the first /)
+    suffix="${ds#*/}"
+    original_set[$suffix]=1
+done
+
+# ── Classify backup datasets ─────────────────────────────────────────────────
+still_exist=()
+orphaned=()
+
+for ds in "${backup_datasets[@]}"; do
+    suffix="${ds#*/}"
+    if [[ -n "${original_set[$suffix]:-}" ]]; then
+        still_exist+=("$ds")
+    else
+        orphaned+=("$ds")
+    fi
+done
+
+# ── Report ────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== Still exist on ${ORIGINAL_DATASET} (${#still_exist[@]} datasets) ==="
+for ds in "${still_exist[@]}"; do
+    echo "  ✓ $ds"
+done
+
+echo ""
+echo "=== Orphaned — missing from ${ORIGINAL_DATASET} (${#orphaned[@]} datasets) ==="
+for ds in "${orphaned[@]}"; do
+    echo "  ✗ $ds"
+done
+
+echo ""
+echo "Summary: ${#still_exist[@]} still exist, ${#orphaned[@]} orphaned"
+
+# ── Delete if requested ──────────────────────────────────────────────────────
+if [[ "$DELETE" == true ]]; then
+    if [[ ${#orphaned[@]} -eq 0 ]]; then
+        echo "Nothing to delete."
+        exit 0
+    fi
+
+    echo ""
+    echo "Deleting orphaned snapshots..."
+    for ds in "${orphaned[@]}"; do
+        # Destroy all snapshots of this dataset recursively.
+        # -r destroys all snapshots and descendant snapshots.
+        echo "  Destroying all snapshots of: ${ds}"
+        sudo zfs destroy -r "${ds}"
+    done
+    echo "Done. Deleted ${#orphaned[@]} orphaned datasets and their snapshots."
+else
+    if [[ ${#orphaned[@]} -gt 0 ]]; then
+        echo ""
+        echo "Run with --delete to destroy orphaned datasets and their snapshots."
+    fi
+fi
