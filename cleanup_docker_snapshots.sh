@@ -102,13 +102,13 @@ done
 echo ""
 echo "=== Still exist on ${ORIGINAL_DATASET} (${#still_exist[@]} datasets) ==="
 for ds in "${still_exist[@]}"; do
-    echo "  ✓ $ds"
+    echo "  $ds"
 done
 
 echo ""
 echo "=== Orphaned — missing from ${ORIGINAL_DATASET} (${#orphaned[@]} datasets) ==="
 for ds in "${orphaned[@]}"; do
-    echo "  ✗ $ds"
+    echo "  $ds"
 done
 
 echo ""
@@ -123,13 +123,20 @@ if [[ "$DELETE" == true ]]; then
 
     echo ""
     echo "Deleting orphaned snapshots..."
+    local total=${#orphaned[@]}
+    local current=0
     for ds in "${orphaned[@]}"; do
-        # Destroy all snapshots of this dataset recursively.
-        # -r destroys all snapshots and descendant snapshots.
-        echo "  Destroying all snapshots of: ${ds}"
+        (( current++ ))
+        local pct=$(( current * 100 / total ))
+        local filled=$(( pct / 2 ))
+        local empty=$(( 50 - filled ))
+        printf "\r  [%-50s] %3d%% (%d/%d) %s" \
+            "$(printf '#%.0s' {1..$filled})" \
+            "$pct" "$current" "$total" "$ds"
         sudo zfs destroy -r "${ds}"
     done
-    echo "Done. Deleted ${#orphaned[@]} orphaned datasets and their snapshots."
+    echo ""
+    echo "Done. Deleted ${total} orphaned datasets and their snapshots."
 else
     if [[ ${#orphaned[@]} -gt 0 ]]; then
         echo ""
