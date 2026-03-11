@@ -210,7 +210,7 @@ if [[ "$DELETE" == true || "$DRY" == true ]]; then
         for ds in "${orphaned[@]}"; do
             (( current++ )) || true
             echo "  [${current}/${total}] Destroying ${ds}..."
-            sudo zfs destroy -r "${ds}"
+            sudo zfs destroy -R "${ds}"
         done
         echo "Done. Deleted ${total} orphaned datasets and their snapshots."
     fi
